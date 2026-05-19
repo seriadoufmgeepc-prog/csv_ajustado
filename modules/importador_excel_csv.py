@@ -110,14 +110,23 @@ def _sniff_delimitador(texto: str) -> str | None:
 
 
 def _ler_csv_com_separador(texto: str, sep: str, header: int | None = 0) -> pd.DataFrame:
+    """Lê CSV preservando campos textuais delimitados por aspas.
+
+    Não utiliza ``on_bad_lines="skip"`` porque essa opção pode ocultar
+    deslocamentos de colunas quando um campo textual contém vírgula, ponto e
+    vírgula ou quebra de linha. O erro deve ser tratado pelo seletor robusto de
+    separador, que tenta outros delimitadores antes de falhar.
+    """
     return pd.read_csv(
         StringIO(texto),
         sep=sep,
         dtype=str,
         header=header,
         engine="python",
-        on_bad_lines="skip",
         keep_default_na=False,
+        quotechar='"',
+        doublequote=True,
+        escapechar="\\",
     ).fillna("")
 
 
@@ -220,41 +229,88 @@ def _mapear_colunas_por_conteudo(df: pd.DataFrame) -> dict[str, str]:
 
 
 def _converter_linhas_raw_siafi(texto: str) -> pd.DataFrame | None:
-    """Fallback para arquivos H/D/T que ficaram em uma única coluna por problema de separador."""
-    registros = []
-    competencia = ""
-    for linha in texto.splitlines():
-        l = linha.strip().strip('"')
-        if not l:
-            continue
-        # Divide por qualquer delimitador comum, preservando campos vazios.
-        partes = [p.strip().strip('"') for p in re.split(r"[;|\t,]", l)]
-        if not partes:
-            continue
-        marca = partes[0].upper()
-        if marca == "H" and len(partes) > 3:
-            competencia = texto_siafi(partes[3], 20)
-        elif marca == "D" and len(partes) >= 3:
-            registros.append({
-                "ug": partes[1] if len(partes) > 1 else "",
-                "restricao": partes[2] if len(partes) > 2 else "",
-                "motivo": partes[3] if len(partes) > 3 else "",
-                "providencia": partes[4] if len(partes) > 4 else "",
-                "valor": partes[5] if len(partes) > 5 else "",
-                "competencia": competencia,
-            })
-    if registros:
-        return pd.DataFrame(registros).fillna("")
-    return None
+    """Fallback quote-aware para arquivos H/D/T gravados em uma única coluna.
 
+    Este fallback só é usado quando a leitura tabular normal não reconhece o
+    arquivo. Ele testa delimitadores comuns com ``csv.reader`` para preservar
+    textos entre aspas, inclusive quando Motivo/Providência contêm separadores.
+    """
+    melhor: pd.DataFrame | None = None
+    melhor_qtd = 0
+    for sep in CSV_SEPARADORES:
+        registros = []
+        competencia = ""
+        try:
+            reader = csv.reader(StringIO(texto), delimiter=sep, quotechar='"', doublequote=True, escapechar="\\")
+            for partes in reader:
+                if not partes:
+                    continue
+                marca = str(partes[0]).strip().upper()
+                if marca == "H" and len(partes) > 3:
+                    competencia = texto_siafi(partes[3], 20)
+                elif marca == "D" and len(partes) >= 3:
+                    registros.append({
+                        "ug": partes[1] if len(partes) > 1 else "",
+                        "restricao": partes[2] if len(partes) > 2 else "",
+                        "motivo": partes[3] if len(partes) > 3 else "",
+                        "providencia": partes[4] if len(partes) > 4 else "",
+                        "valor": partes[5] if len(partes) > 5 else "",
+                        "competencia": competencia,
+                    })
+        except csv.Error:
+            continue
+        if len(registros) > melhor_qtd:
+            melhor_qtd = len(registros)
+            melhor = pd.DataFrame(registros).fillna("")
+    return melhor if melhor_qtd else None
+
+
+def _score_dataframe_csv(df: pd.DataFrame, header: bool) -> int:
+    """Pontua a leitura de CSV para escolher o separador menos arriscado.
+
+    A pontuação privilegia cabeçalhos reconhecidos e penaliza leituras que
+    fragmentam texto em muitas colunas, causa típica do deslocamento de
+    Providência para Valor.
+    """
+    if df is None or df.empty:
+        return -100_000
+    score = 0
+    largura = int(df.shape[1])
+    linhas = min(int(len(df)), 200)
+    if header:
+        normalizadas = [normalizar_coluna(c) for c in df.columns]
+        campos_reconhecidos = 0
+        for nomes in ALIAS.values():
+            if any(n in nomes for n in normalizadas):
+                campos_reconhecidos += 1
+        score += campos_reconhecidos * 800
+        if _tem_colunas_obrigatorias(df):
+            score += 3000
+        if "providencia" in _detectar_colunas_sem_erro(df) and "valor" in _detectar_colunas_sem_erro(df):
+            score += 700
+    else:
+        if _parece_csv_siafi(df):
+            score += 5000
+        if _mapear_colunas_por_conteudo(df):
+            score += 1200
+    # Layouts esperados ficam em torno de 5 a 13 colunas. Muitas colunas tendem
+    # a indicar separador errado em textos longos.
+    if 2 <= largura <= 13:
+        score += 200
+    elif largura > 13:
+        score -= (largura - 13) * 120
+    score += linhas
+    return score
+
+
+def _detectar_colunas_sem_erro(df: pd.DataFrame) -> dict[str, str]:
+    try:
+        return _detectar_colunas(df)
+    except Exception:
+        return {}
 
 def _ler_csv_robusto(dados: bytes) -> pd.DataFrame:
     texto = _remover_linha_sep_excel(_decodificar_csv(dados))
-
-    # Fallback inicial para arquivos finais H/D/T que eventualmente não sejam lidos como tabela.
-    raw_siafi = _converter_linhas_raw_siafi(texto)
-    if raw_siafi is not None and not raw_siafi.empty:
-        return raw_siafi
 
     candidatos: list[str] = []
     sniff = _sniff_delimitador(texto)
@@ -262,49 +318,59 @@ def _ler_csv_robusto(dados: bytes) -> pd.DataFrame:
         candidatos.append(sniff)
     candidatos.extend([sep for sep in CSV_SEPARADORES if sep not in candidatos])
 
-    melhor_df = None
-    melhor_score = -10_000
+    leituras: list[tuple[int, str, str, pd.DataFrame]] = []
+    erros: list[str] = []
 
     for sep in candidatos:
         try:
-            df_header = _ler_csv_com_separador(texto, sep=sep, header=0)
             df_no_header = _ler_csv_com_separador(texto, sep=sep, header=None)
-        except Exception:
-            continue
+            leituras.append((_score_dataframe_csv(df_no_header, header=False), sep, "sem_cabecalho", df_no_header))
+        except Exception as exc:
+            erros.append(f"{repr(sep)} sem cabeçalho: {exc}")
 
-        # Prioridade 1: CSV final gerado para SIAFI/app, sem cabeçalho, com linhas H/D/T.
-        if _parece_csv_siafi(df_no_header):
-            return _converter_csv_siafi_para_tabela(df_no_header)
+        try:
+            df_header = _ler_csv_com_separador(texto, sep=sep, header=0)
+            leituras.append((_score_dataframe_csv(df_header, header=True), sep, "com_cabecalho", df_header))
+        except Exception as exc:
+            erros.append(f"{repr(sep)} com cabeçalho: {exc}")
 
-        # Prioridade 2: cabeçalho fora da primeira linha.
-        df_promovido = _promover_cabecalho_encontrado(df_no_header)
-        if df_promovido is not None and _tem_colunas_obrigatorias(df_promovido):
-            return df_promovido
+    if not leituras:
+        raw_siafi = _converter_linhas_raw_siafi(texto)
+        if raw_siafi is not None and not raw_siafi.empty:
+            return raw_siafi
+        detalhe = "; ".join(erros[:4])
+        raise ValueError("Não foi possível ler o arquivo CSV. Verifique a codificação, o separador e o conteúdo do arquivo." + (f" Detalhes: {detalhe}" if detalhe else ""))
 
-        # Prioridade 3: arquivo sem cabeçalho, mas com colunas posicionais detectáveis
-        # por conteúdo. Isso evita perder a primeira linha quando o CSV começa
-        # diretamente com registros, por exemplo: 153062;642;motivo;providência.
-        mapa_sem_cabecalho = _mapear_colunas_por_conteudo(df_no_header)
-        if mapa_sem_cabecalho:
-            df_posicional = df_no_header.copy().fillna("")
-            df_posicional.columns = [f"coluna_{i+1}" for i in range(df_posicional.shape[1])]
-            return df_posicional
+    leituras.sort(key=lambda item: item[0], reverse=True)
 
-        # Prioridade 4: CSV tabular com cabeçalhos reconhecíveis.
-        largura = int(df_header.shape[1])
-        obrig = 1000 if _tem_colunas_obrigatorias(df_header) else 0
-        posicional = 250 if _mapear_colunas_por_conteudo(df_header) else 0
-        linhas = min(len(df_header), 100)
-        score = obrig + posicional + largura + linhas
-        if score > melhor_score:
-            melhor_score = score
-            melhor_df = df_header
+    for _, sep, modo, df in leituras:
+        if modo == "sem_cabecalho" and _parece_csv_siafi(df):
+            return _converter_csv_siafi_para_tabela(df)
 
-    if melhor_df is None:
-        raise ValueError("Não foi possível ler o arquivo CSV. Verifique a codificação, o separador e o conteúdo do arquivo.")
+        if modo == "sem_cabecalho":
+            df_promovido = _promover_cabecalho_encontrado(df)
+            if df_promovido is not None and _tem_colunas_obrigatorias(df_promovido):
+                return df_promovido
 
-    return melhor_df.fillna("")
+        if modo == "com_cabecalho" and _tem_colunas_obrigatorias(df):
+            return df.fillna("")
 
+    # Somente depois de esgotar cabeçalhos confiáveis usa mapeamento por conteúdo.
+    # Isso evita aceitar leituras nas quais vírgulas/ponto e vírgula em Providência
+    # criaram colunas artificiais e deslocaram Valor.
+    for _, sep, modo, df in leituras:
+        if _mapear_colunas_por_conteudo(df):
+            return df.fillna("")
+
+    raw_siafi = _converter_linhas_raw_siafi(texto)
+    if raw_siafi is not None and not raw_siafi.empty:
+        return raw_siafi
+
+    melhor_df = leituras[0][3]
+    if melhor_df is not None and not melhor_df.empty:
+        return melhor_df.fillna("")
+
+    raise ValueError("Não foi possível ler o arquivo CSV. Verifique a codificação, o separador e o conteúdo do arquivo.")
 
 def ler_tabela(uploaded_file) -> pd.DataFrame:
     nome = uploaded_file.name.lower()
@@ -322,8 +388,8 @@ def dataframe_para_registros(df: pd.DataFrame, origem: str, arquivo: str) -> lis
         reg = RegistroRestricao(
             ug=codigo_ug(row.get(mapa.get("ug", ""), "")),
             restricao=codigo_restricao(row.get(mapa.get("restricao", ""), "")),
-            motivo=texto_siafi(row.get(mapa.get("motivo", ""), ""), 100000),
-            providencia=texto_siafi(row.get(mapa.get("providencia", ""), ""), 100000),
+            motivo=texto_siafi(row.get(mapa.get("motivo", ""), "")),
+            providencia=texto_siafi(row.get(mapa.get("providencia", ""), "")),
             valor=moeda_para_digitos(row.get(mapa.get("valor", ""), "")),
             competencia=normalizar_competencia(row.get(mapa.get("competencia", ""), "")),
             grupo=texto_siafi(row.get(mapa.get("grupo", ""), ""), 120),

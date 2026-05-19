@@ -18,11 +18,12 @@
 - Inclusão de ordenação por UG crescente e restrição crescente nas visualizações e na exportação.
 - A ordenação foi aplicada sem criação de colunas auxiliares permanentes.
 
-## Correção adicional — aderência ao anexo STN de Upload de Restrições
+## Correção adicional – importação Excel/CSV e alteração em lote
 
-- Corrigido o tratamento dos campos Motivo e Providência, que passaram a ser opcionais conforme o layout STN.
-- Corrigida a regra do Valor: campo numérico de até 17 posições, sem pontos ou vírgulas, com as duas últimas posições correspondentes aos centavos.
-- Corrigida a coluna visual Valor em R$ para interpretar o valor bruto como centavos.
-- Ajustado o CSV final para Header, Detalhe e Trailer com 7 colunas, campos vazios reais e pipe na coluna G.
-- Alterada a codificação do download para UTF-8.
-- Preservado o conteúdo de Motivo e Providência até a validação, evitando truncamento silencioso antes da conferência do usuário.
+- Revisada a leitura robusta de arquivos CSV para preservar campos textuais entre aspas, inclusive quando contêm vírgulas, ponto e vírgula, barras verticais, tabulações ou quebras de linha.
+- Removido o uso de leitura CSV com descarte silencioso de linhas inconsistentes, evitando que deslocamentos de coluna passem despercebidos.
+- Ajustada a seleção automática de delimitador com pontuação por cabeçalhos reconhecidos e penalização de leituras que fragmentem textos em colunas artificiais.
+- Corrigido o fallback de arquivos H/D/T para usar `csv.reader`, preservando corretamente Motivo e Providência quando contêm separadores internos.
+- Mantida a preservação da coluna Providência na importação por Excel e CSV, sem deslocamento indevido para a coluna Valor.
+- Ajustada a alteração em lote para disponibilizar somente os campos UG, Restrição, Motivo, Providência e Valor, com rótulos compatíveis com a tabela de edição.
+- Incluída normalização específica por campo na alteração em lote: UG, Restrição, Valor e textos de Motivo/Providência.

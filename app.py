@@ -2,6 +2,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import base64
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import re
 import pandas as pd
 import streamlit as st
 
@@ -13,7 +15,7 @@ from modules.validador import registros_para_dataframe, dataframe_para_registros
 from modules.gerador_csv import gerar_csv_siafi, nome_csv_padrao
 from modules.relatorios import gerar_xlsx_abas, modelo_importacao, resumo_por_ug, ugs_sem_restricao
 from modules.graficos import exibir_graficos_resumo_streamlit
-from modules.normalizacao import codigo_ug, codigo_restricao, texto_siafi, moeda_para_digitos, normalizar_competencia, formatar_valor_siafi_brl
+from modules.normalizacao import codigo_ug, codigo_restricao, texto_siafi, moeda_para_digitos, normalizar_competencia
 from modules.capitalizacao import aplicar_capitalizacao_df, OPCOES_CAPITALIZACAO
 
 APP_TITLE = "Gerador de Arquivo CSV para Upload de Restrições Contábeis no SIAFI"
@@ -54,6 +56,50 @@ COLUNA_VALOR_VALIDACAO = "Valor em R$"
 COLUNAS_VISUAIS = ["Linha", COLUNA_VALOR_VALIDACAO]
 
 
+def _parse_decimal_valor(valor: object) -> Decimal | None:
+    """Interpreta valores digitados em formato brasileiro ou decimal simples.
+
+    A função é usada apenas para a coluna visual "Valor em R$". Ela não altera o
+    valor bruto usado na exportação CSV para o SIAFI.
+    """
+    texto = str(valor or "").strip()
+    if not texto or texto.lower() in {"nan", "none", "nat"}:
+        return None
+    texto = texto.replace("R$", "").replace(" ", "")
+    texto = re.sub(r"[^0-9,.-]", "", texto)
+    if not texto or texto in {"-", ".", ","}:
+        return None
+
+    try:
+        if "," in texto:
+            # Padrão brasileiro: 1.234.567,80
+            normalizado = texto.replace(".", "").replace(",", ".")
+        elif "." in texto:
+            partes = texto.split(".")
+            # Quando há um único ponto e 1 ou 2 casas finais, trata como decimal.
+            # Nos demais casos, interpreta os pontos como separadores de milhar.
+            if len(partes) == 2 and 1 <= len(partes[1]) <= 2:
+                normalizado = texto
+            else:
+                normalizado = texto.replace(".", "")
+        else:
+            normalizado = texto
+        return Decimal(normalizado)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def formatar_valor_brl(valor: object) -> str:
+    numero = _parse_decimal_valor(valor)
+    if numero is None:
+        return ""
+    numero = numero.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    sinal = "-" if numero < 0 else ""
+    numero = abs(numero)
+    inteiro, decimal = f"{numero:.2f}".split(".")
+    inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
+    return f"{sinal}{inteiro_fmt},{decimal}"
+
 
 def ordenar_dataframe_edicao(df: pd.DataFrame) -> pd.DataFrame:
     """Ordena a visualização por UG e restrição sem modificar o layout lógico."""
@@ -76,7 +122,7 @@ def inserir_coluna_valor_validacao(df: pd.DataFrame) -> pd.DataFrame:
     if "valor" not in out.columns:
         return out
     pos = list(out.columns).index("valor") + 1
-    out.insert(pos, COLUNA_VALOR_VALIDACAO, out["valor"].map(formatar_valor_siafi_brl))
+    out.insert(pos, COLUNA_VALOR_VALIDACAO, out["valor"].map(formatar_valor_brl))
     return out
 
 
@@ -91,6 +137,27 @@ def preparar_dataframe_edicao(df: pd.DataFrame, incluir_linha: bool = False) -> 
 def remover_colunas_visuais(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=[c for c in COLUNAS_VISUAIS if c in df.columns], errors="ignore")
 
+
+
+
+CAMPOS_LOTE = {
+    "UG": "ug",
+    "Restrição": "restricao",
+    "Motivo": "motivo",
+    "Providência": "providencia",
+    "Valor": "valor",
+}
+
+
+def normalizar_valor_lote(campo: str, valor: object) -> str:
+    """Aplica a regra própria do campo alterado em lote."""
+    if campo == "ug":
+        return codigo_ug(valor)
+    if campo == "restricao":
+        return codigo_restricao(valor)
+    if campo == "valor":
+        return moeda_para_digitos(valor)
+    return texto_siafi(valor)
 
 def registros_ordenados(registros: list[RegistroRestricao]) -> list[RegistroRestricao]:
     df = registros_para_dataframe(registros)
@@ -355,7 +422,7 @@ with tab_imp:
             for _, row in edit_base.fillna("").iterrows():
                 regs.append(RegistroRestricao(
                     ug=codigo_ug(row.get("ug", "")), restricao=codigo_restricao(row.get("restricao", "")),
-                    motivo=texto_siafi(row.get("motivo", ""), 100000), providencia=texto_siafi(row.get("providencia", ""), 100000),
+                    motivo=texto_siafi(row.get("motivo", "")), providencia=texto_siafi(row.get("providencia", "")),
                     valor=moeda_para_digitos(row.get("valor", "")), competencia=normalizar_competencia(row.get("competencia", "")),
                     grupo=texto_siafi(row.get("grupo", ""), 120), conta_contabil=texto_siafi(row.get("conta_contabil", ""), 40),
                     equacao=texto_siafi(row.get("equacao", ""), 40), situacao=texto_siafi(row.get("situacao", ""), 80),
@@ -397,10 +464,11 @@ with tab_conf:
         with st.expander("Edição em lote com base nos filtros aplicados", expanded=False):
             st.warning("A edição em lote será aplicada somente aos registros atualmente filtrados. Revise os filtros antes de confirmar.")
             b1, b2 = st.columns(2)
-            campo_lote = b1.selectbox("Campo a alterar em lote", ["motivo", "providencia", "competencia", "grupo", "situacao", "conta_contabil", "equacao"])
+            campo_lote_rotulo = b1.selectbox("Campo a alterar em lote", list(CAMPOS_LOTE.keys()))
+            campo_lote = CAMPOS_LOTE[campo_lote_rotulo]
             valor_lote = b2.text_area("Novo valor", height=100, placeholder="Informe o conteúdo que substituirá o campo selecionado nos registros filtrados")
             ccap1, ccap2 = st.columns(2)
-            aplicar_cap = ccap1.checkbox("Aplicar capitalização automática ao novo valor", value=True)
+            aplicar_cap = ccap1.checkbox("Aplicar capitalização automática ao novo valor", value=True, disabled=campo_lote not in ["motivo", "providencia"])
             modo_cap = ccap2.selectbox("Modo de capitalização", OPCOES_CAPITALIZACAO, help="Transformação textual controlada, com preservação técnica de siglas, códigos e símbolos financeiros.")
             st.info(f"Registros que serão afetados: {len(df_filtrado)}. A ação usará os filtros atualmente aplicados.")
             confirmar_lote = st.checkbox("Confirmo que revisei os filtros e desejo aplicar a alteração em lote")
@@ -408,12 +476,12 @@ with tab_conf:
             if st.button("Aplicar edição em lote", type="primary", disabled=not confirmar_lote or chave_lote.strip().upper() != "APLICAR" or df_filtrado.empty):
                 st.session_state.backup_registros = st.session_state.registros
                 df_base = df_regs.copy()
-                novo_valor = valor_lote
-                if aplicar_cap and campo_lote in ["motivo", "providencia", "grupo", "situacao"]:
+                novo_valor = normalizar_valor_lote(campo_lote, valor_lote)
+                if aplicar_cap and campo_lote in ["motivo", "providencia"]:
                     novo_valor = aplicar_capitalizacao_df(pd.DataFrame({campo_lote: [novo_valor]}), [campo_lote], modo_cap).iloc[0][campo_lote]
                 df_base.loc[mask, campo_lote] = novo_valor
                 st.session_state.registros = registros_ordenados(dataframe_para_registros(df_base))
-                st.success(f"Edição em lote aplicada em {int(mask.sum())} registro(s).")
+                st.success(f"Edição em lote aplicada em {int(mask.sum())} registro(s) no campo {campo_lote_rotulo}.")
                 st.rerun()
 
         with st.expander("Capitalização automática segura nos registros filtrados", expanded=False):
@@ -534,7 +602,7 @@ with tab_exp:
     else:
         csv_final = gerar_csv_siafi(nivel, codigo_responsavel, mes, regs)
         st.text_area("Pré-visualização do CSV", csv_final[:5000], height=220)
-        st.download_button("Baixar CSV final para upload no SIAFI", data=csv_final.encode("utf-8"), file_name=nome_csv_padrao(mes, ano, codigo_responsavel), mime="text/csv", type="primary")
+        st.download_button("Baixar CSV final para upload no SIAFI", data=csv_final.encode("utf-8-sig"), file_name=nome_csv_padrao(mes, ano, codigo_responsavel), mime="text/csv", type="primary")
 
 with tab_ref:
     st.subheader("5. Tabelas internas de referência")
