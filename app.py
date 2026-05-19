@@ -56,49 +56,32 @@ COLUNA_VALOR_VALIDACAO = "Valor em R$"
 COLUNAS_VISUAIS = ["Linha", COLUNA_VALOR_VALIDACAO]
 
 
-def _parse_decimal_valor(valor: object) -> Decimal | None:
-    """Interpreta valores digitados em formato brasileiro ou decimal simples.
+def _valor_siafi_para_decimal(valor: object) -> Decimal | None:
+    """Converte o campo Valor do SIAFI para Decimal apenas para conferência visual.
 
-    A função é usada apenas para a coluna visual "Valor em R$". Ela não altera o
-    valor bruto usado na exportação CSV para o SIAFI.
+    Regra aplicada: o campo Valor é numérico, sem pontos ou vírgulas, e as duas
+    últimas posições representam os centavos. Separadores eventualmente digitados
+    ou importados são ignorados para a leitura visual, sem alterar o valor bruto
+    que será exportado após a normalização.
     """
     texto = str(valor or "").strip()
     if not texto or texto.lower() in {"nan", "none", "nat"}:
         return None
-    texto = texto.replace("R$", "").replace(" ", "")
-    texto = re.sub(r"[^0-9,.-]", "", texto)
-    if not texto or texto in {"-", ".", ","}:
+    digitos = re.sub(r"\D", "", texto)
+    if not digitos:
         return None
-
-    try:
-        if "," in texto:
-            # Padrão brasileiro: 1.234.567,80
-            normalizado = texto.replace(".", "").replace(",", ".")
-        elif "." in texto:
-            partes = texto.split(".")
-            # Quando há um único ponto e 1 ou 2 casas finais, trata como decimal.
-            # Nos demais casos, interpreta os pontos como separadores de milhar.
-            if len(partes) == 2 and 1 <= len(partes[1]) <= 2:
-                normalizado = texto
-            else:
-                normalizado = texto.replace(".", "")
-        else:
-            normalizado = texto
-        return Decimal(normalizado)
-    except (InvalidOperation, ValueError):
-        return None
+    # Garante pelo menos três posições para separar parte inteira e centavos.
+    digitos = digitos.zfill(3)
+    return (Decimal(digitos) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def formatar_valor_brl(valor: object) -> str:
-    numero = _parse_decimal_valor(valor)
+    numero = _valor_siafi_para_decimal(valor)
     if numero is None:
         return ""
-    numero = numero.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    sinal = "-" if numero < 0 else ""
-    numero = abs(numero)
     inteiro, decimal = f"{numero:.2f}".split(".")
     inteiro_fmt = f"{int(inteiro):,}".replace(",", ".")
-    return f"{sinal}{inteiro_fmt},{decimal}"
+    return f"{inteiro_fmt},{decimal}"
 
 
 def ordenar_dataframe_edicao(df: pd.DataFrame) -> pd.DataFrame:
